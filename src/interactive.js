@@ -33,38 +33,44 @@ function verifySlackRequest(rawBodyString, timestamp, signature) {
 }
 
 async function handleSlackInteraction(payload) {
-  console.log('Received interaction:', JSON.stringify(payload, null, 2));
-
-  const { type, actions, user } = payload;
+  const { type, actions, user, message } = payload;
 
   if (type === 'block_actions' && actions && actions.length > 0) {
     const action = actions[0];
 
     switch (action.action_id) {
       case 'mark_read': {
-        // action.value にNotionページIDが入っている（slack.jsで設定）
         const pageId = action.value;
         const userName = user.real_name || user.name || user.id;
 
+        let readerCount = 0;
         try {
-          await markPageAsRead(pageId, userName);
+          const result = await markPageAsRead(pageId, userName);
+          readerCount = result.readerCount;
         } catch (err) {
-          // Notionの更新失敗はSlack側の応答に影響させない
+          // Notionの更新失敗はSlack側のフィードバックに影響させない
           console.error('Failed to update Notion read status:', err.message);
         }
+
+        // 元のメッセージブロックを保持しつつ、actionsブロックをフィードバックに差し替える。
+        // payload.message.blocks に元のブロック一覧が含まれている。
+        const originalBlocks = message?.blocks ?? [];
+        const updatedBlocks = [
+          ...originalBlocks.filter(b => b.type !== 'actions'),
+          {
+            type: 'context',
+            elements: [{
+              type: 'mrkdwn',
+              text: `✅ *${userName}* が既読マークしました（既読 ${readerCount}人）`
+            }]
+          }
+        ];
 
         return {
           response_type: 'in_channel',
           replace_original: true,
-          blocks: [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `✅ *${userName}* が既読マークしました`
-              }
-            }
-          ]
+          text: `✅ ${userName} が既読マークしました（既読 ${readerCount}人）`,
+          blocks: updatedBlocks
         };
       }
 

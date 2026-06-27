@@ -24,46 +24,66 @@ function getSlackChannel() {
   return process.env.SLACK_CHANNEL || 'development-test';
 }
 
+function buildNotificationBlocks(page) {
+  const blocks = [];
+
+  // ① @channel ヘッダー
+  blocks.push({
+    type: 'section',
+    text: { type: 'mrkdwn', text: `<!channel> *システム*が *:bulb: お知らせ* へ追加しました` }
+  });
+
+  // ② タイトル行（種別・重要度タグ付き） + Open in Notion ボタン
+  const metaTags = [];
+  if (page.kind) metaTags.push(`種別: *${page.kind}*`);
+  if (page.importance) metaTags.push(`重要度: *${page.importance}*`);
+  const metaLine = metaTags.length > 0 ? `\n${metaTags.join('　｜　')}` : '';
+
+  blocks.push({
+    type: 'section',
+    text: { type: 'mrkdwn', text: `📢 *${page.title}*${metaLine}` },
+    accessory: {
+      type: 'button',
+      text: { type: 'plain_text', text: 'Open in Notion', emoji: true },
+      value: page.id,
+      url: page.url,
+      action_id: 'open_notion'
+    }
+  });
+
+  // ③ 本文要点（取得できた場合のみ）
+  if (page.body && page.body.trim()) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: page.body }
+    });
+  }
+
+  // ④ 区切り線
+  blocks.push({ type: 'divider' });
+
+  // ⑤ 既読ボタン（value に Notion ページ ID をセット）
+  blocks.push({
+    type: 'actions',
+    elements: [
+      {
+        type: 'button',
+        text: { type: 'plain_text', text: '✅ 既読', emoji: true },
+        value: page.id,
+        action_id: 'mark_read',
+        style: 'primary'
+      }
+    ]
+  });
+
+  return blocks;
+}
+
 async function sendSlackMessage(botToken, channel, page) {
   const payload = {
     channel,
-    text: `<!channel> *システム*が*:bulb: お知らせ*へ追加`,
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `<!channel> *システム*が*:bulb: お知らせ*へ追加`
-        }
-      },
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `📢 *${page.title}*\n\n問題なければ既読ボタンを押してください。`
-        },
-        accessory: {
-          type: 'button',
-          text: { type: 'plain_text', text: 'Open in Notion', emoji: true },
-          value: page.id,
-          url: page.url,
-          action_id: 'open_notion'
-        }
-      },
-      {
-        type: 'actions',
-        elements: [
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: '✅ 既読', emoji: true },
-            // value にNotionページIDを入れてインタラクション時にNotionを更新できるようにする
-            value: page.id,
-            action_id: 'mark_read',
-            style: 'primary'
-          }
-        ]
-      }
-    ]
+    text: `📢 お知らせ: ${page.title}`,  // プッシュ通知 / フォールバックテキスト
+    blocks: buildNotificationBlocks(page)
   };
 
   const response = await axios.post('https://slack.com/api/chat.postMessage', payload, {
@@ -109,4 +129,4 @@ async function sendSlackNotifications(pages) {
   return results;
 }
 
-module.exports = { sendSlackNotifications };
+module.exports = { sendSlackNotifications, buildNotificationBlocks };
