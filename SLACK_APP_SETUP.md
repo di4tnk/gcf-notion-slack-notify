@@ -1,78 +1,89 @@
-# Slack App設定手順
+# Slack App 設定手順
 
-インタラクティブ要素（ボタン）を有効にするには、Slack Appの設定が必要です。
+## 概要
 
-## 1. Slack Appの作成
+このシステムは **Incoming Webhook ではなく Slack Bot Token** を使用します。  
+Bot Token 方式にすることで `SLACK_CHANNEL` 環境変数だけで通知先チャンネルを切り替えられます。
 
-1. [Slack API](https://api.slack.com/apps)にアクセス
-2. 「Create New App」→「From scratch」を選択
-3. App名とワークスペースを設定
+---
 
-## 2. Incoming Webhooksの設定
+## 1. Slack App の作成
 
-1. 左メニューから「Incoming Webhooks」を選択
-2. 「Activate Incoming Webhooks」をONに設定
-3. 「Add New Webhook to Workspace」で通知チャンネルを選択
-4. Webhook URLを `.env` の `SLACK_WEBHOOK_URL` に設定
+1. [Slack API](https://api.slack.com/apps) にアクセスし **「Create New App」→「From scratch」**
+2. **App Name**: `Notion Notify`（任意）
+3. ワークスペースを選択して作成
 
-## 3. Interactive Components（重要）
+---
 
-1. 左メニューから「Interactivity & Shortcuts」を選択
-2. 「Interactivity」をONに設定
-3. **Request URL**に以下を設定：
+## 2. Bot Token Scopes の設定（重要）
+
+1. 左メニュー「**OAuth & Permissions**」を選択
+2. 「**Scopes**」セクションの「**Bot Token Scopes**」に以下を追加：
+
+| Scope | 用途 |
+|-------|------|
+| `chat:write` | チャンネルへのメッセージ投稿 |
+| `chat:write.public` | ボットが参加していないパブリックチャンネルへの投稿 |
+
+> `chat:write.public` を付与することで、ボットをチャンネルに招待しなくても `#development-test` や `#general-announcements` に投稿できます。
+
+3. 「**Install to Workspace**」→ 権限を承認
+4. 「**Bot User OAuth Token**（`xoxb-...`）」をコピーして `.env` の `SLACK_BOT_TOKEN` に設定
+
+---
+
+## 3. Interactivity（既読ボタン）の設定
+
+1. 左メニュー「**Interactivity & Shortcuts**」を選択
+2. 「**Interactivity**」を **ON**
+3. **Request URL** にデプロイ後の Cloud Functions URL を設定：
    ```
-   https://your-cloud-function-url/
+   https://REGION-PROJECT_ID.cloudfunctions.net/notion-slack-notify
    ```
-   例: `https://us-central1-your-project.cloudfunctions.net/notion-slack-notify`
+   例: `https://asia-northeast1-studiokaren.cloudfunctions.net/notion-slack-notify`
 
-## 4. Event Subscriptions（必要に応じて）
+4. 「**Save Changes**」
 
-1. 左メニューから「Event Subscriptions」を選択
-2. 「Enable Events」をONに設定
-3. Request URLを同じURLに設定
+> **注意**: ローカル開発中に既読ボタンをテストする場合は [ngrok](https://ngrok.com/) などで `http://localhost:8080` をトンネルし、そのURLを設定してください。
 
-## 5. OAuth & Permissions
+---
 
-1. 左メニューから「OAuth & Permissions」を選択
-2. 以下のBot Token Scopesを追加：
-   - `chat:write`
-   - `chat:write.public`
-   - `incoming-webhook`
+## 4. Signing Secret の取得
 
-## 6. Signing Secret
+1. 左メニュー「**Basic Information**」を選択
+2. 「**App Credentials**」セクションの「**Signing Secret**」をコピー
+3. `.env` の `SLACK_SIGNING_SECRET` に設定
+4. Secret Manager にも登録: `./register-secrets.sh`
 
-1. 左メニューから「Basic Information」を選択
-2. 「App Credentials」の「Signing Secret」をコピー
-3. Secret Managerまたは環境変数 `SLACK_SIGNING_SECRET` に設定
+---
 
-## 7. アプリのインストール
+## 5. 通知チャンネルの切り替え
 
-1. 「OAuth & Permissions」ページで「Install to Workspace」
-2. 権限を承認
+| 環境 | `SLACK_CHANNEL` の値 |
+|------|---------------------|
+| テスト | `development-test` |
+| 本番 | `general-announcements` |
 
-## 8. 環境変数設定
+`.env` の `SLACK_CHANNEL` を変更するだけで切り替えできます。GCF デプロイ時は `--set-env-vars SLACK_CHANNEL=general-announcements` で指定します。
+
+---
+
+## 6. 動作確認
 
 ```bash
-# Secret Manager設定
-gcloud secrets create SLACK_SIGNING_SECRET --data-file=- <<< "your_signing_secret"
+# ローカル
+curl -X POST http://localhost:8080/
 
-# または .env ファイル
-SLACK_SIGNING_SECRET=your_signing_secret_here
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+# テスト送信（ダミーページを用意して確認）
 ```
+
+送信されたメッセージの「✅ 既読」ボタンを押して、Notion DB の「既読者」「既読数」が更新されることを確認してください。
+
+---
 
 ## インタラクティブ機能
 
-設定完了後、以下の機能が利用可能：
-
-- **既読ボタン**: クリックすると「○○が既読マークしました」に変更
-- **Open in Notionボタン**: Notionページへ直接リンク
-- **@channelメンション**: チャンネル全体への通知
-
-## テスト
-
-```bash
-curl -X POST http://localhost:8080/
-```
-
-ボタンをクリックして応答を確認してください。
+| ボタン | 動作 |
+|--------|------|
+| **✅ 既読** | Notion の「既読者」に押した人の名前を追記、「既読数」を +1、Slackメッセージを「〇〇が既読マークしました」に置換 |
+| **Open in Notion** | Notion ページを直接開く |

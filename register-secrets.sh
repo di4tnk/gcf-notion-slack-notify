@@ -1,66 +1,51 @@
 #!/bin/bash
 
 # .envファイルからSecret Managerにシークレットを登録するスクリプト
+# 使用前に: gcloud auth login && gcloud config set project YOUR_PROJECT_ID
+
+set -e
 
 echo "Starting secret registration from .env file..."
 
-# .envファイルの存在確認
 if [ ! -f ".env" ]; then
     echo "Error: .env file not found!"
+    echo "cp .env.example .env を実行してから値を入力してください。"
     exit 1
 fi
 
-# 各行を読み取り
-while IFS='=' read -r key value; do
-  # コメント行と空行をスキップ
-  if [[ $key =~ ^#.*$ ]] || [[ -z "$key" ]]; then
-    continue
+register_or_update_secret() {
+  local key="$1"
+  local value="$2"
+
+  if gcloud secrets describe "$key" &>/dev/null 2>&1; then
+    echo "  Updating existing secret: $key"
+    echo -n "$value" | gcloud secrets versions add "$key" --data-file=-
+  else
+    echo "  Creating new secret: $key"
+    echo -n "$value" | gcloud secrets create "$key" --data-file=-
   fi
-  
-  # 値から引用符を削除（もしあれば）
-  value=$(echo "$value" | sed 's/^"//;s/"$//')
-  
-  # 必要なシークレットのみ登録
+
+  if [ $? -eq 0 ]; then
+    echo "  ✅ $key registered"
+  else
+    echo "  ❌ Failed to register $key"
+  fi
+}
+
+while IFS='=' read -r key value; do
+  # コメント行・空行・変数参照行をスキップ
+  [[ "$key" =~ ^#.*$ ]] || [[ -z "$key" ]] && continue
+  # 値から引用符と余分な空白を除去
+  value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+
   case $key in
-    NOTION_TOKEN)
+    NOTION_TOKEN|NOTION_DATABASE_ID|SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET)
       echo "Registering $key..."
-      echo "$value" | gcloud secrets create "$key" --data-file=-
-      if [ $? -eq 0 ]; then
-        echo "✅ $key registered successfully"
-      else
-        echo "❌ Failed to register $key"
-      fi
-      ;;
-    NOTION_DATABASE_ID)
-      echo "Registering $key..."
-      echo "$value" | gcloud secrets create "$key" --data-file=-
-      if [ $? -eq 0 ]; then
-        echo "✅ $key registered successfully"
-      else
-        echo "❌ Failed to register $key"
-      fi
-      ;;
-    SLACK_WEBHOOK_URL)
-      echo "Registering $key..."
-      echo "$value" | gcloud secrets create "$key" --data-file=-
-      if [ $? -eq 0 ]; then
-        echo "✅ $key registered successfully"
-      else
-        echo "❌ Failed to register $key"
-      fi
-      ;;
-    SLACK_SIGNING_SECRET)
-      echo "Registering $key..."
-      echo "$value" | gcloud secrets create "$key" --data-file=-
-      if [ $? -eq 0 ]; then
-        echo "✅ $key registered successfully"
-      else
-        echo "❌ Failed to register $key"
-      fi
+      register_or_update_secret "$key" "$value"
       ;;
   esac
 done < .env
 
 echo ""
-echo "Registration completed. Listing all secrets:"
+echo "Registration completed. Listing secrets:"
 gcloud secrets list
