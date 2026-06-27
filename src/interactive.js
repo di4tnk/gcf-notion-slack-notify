@@ -57,14 +57,18 @@ async function fetchSlackDisplayName(userId, fallback) {
     const profile = res.data.user?.profile;
     const u = res.data.user;
 
-    // 空文字は飛ばして最初に値があるものを採用
+    // 優先順位: real_name → profile.display_name → name → id
+    // real_name を先にする理由: display_name はハンドル名がそのまま入っている場合があり、
+    // real_name のほうが人間に読みやすい正式名（例: 田中 大輔）を持つことが多いため。
+    // 空文字は飛ばして最初に値があるものを採用。
     const candidates = [
-      profile?.display_name,
       u?.real_name,
+      profile?.display_name,
       u?.name,
       u?.id
     ];
     const displayName = candidates.find(v => v && v.trim() !== '');
+    console.log(`users.info — real_name:"${u?.real_name}" display_name:"${profile?.display_name}" → adopted:"${displayName}"`);
     return displayName || fallback;
 
   } catch (err) {
