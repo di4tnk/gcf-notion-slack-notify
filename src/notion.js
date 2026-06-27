@@ -118,12 +118,17 @@ async function markPageAsRead(pageId, slackUserName) {
 
   if (page.properties[readersPropertyName]) {
     const prop = page.properties[readersPropertyName];
-    let currentReaders = '';
-    if (prop.type === 'rich_text' && prop.rich_text.length > 0) {
-      currentReaders = prop.rich_text.map(t => t.plain_text).join('');
+    if (prop.type === 'rich_text') {
+      const currentReaders = prop.rich_text.length > 0
+        ? prop.rich_text.map(t => t.plain_text).join('')
+        : '';
+      const newReaders = currentReaders ? `${currentReaders}, ${slackUserName}` : slackUserName;
+      updates[readersPropertyName] = { rich_text: [{ text: { content: newReaders } }] };
+    } else {
+      // people型など rich_text 以外は名前での更新不可のためスキップ
+      // Notionの「既読者」プロパティをテキスト型に変更するか、別途手動で管理してください
+      console.warn(`Property "${readersPropertyName}" is type "${prop.type}" (not rich_text) — skipping. Change it to text type in Notion to enable auto-update.`);
     }
-    const newReaders = currentReaders ? `${currentReaders}, ${slackUserName}` : slackUserName;
-    updates[readersPropertyName] = { rich_text: [{ text: { content: newReaders } }] };
   } else {
     console.warn(`Property "${readersPropertyName}" not found — skipping 既読者 update`);
   }
@@ -136,8 +141,23 @@ async function markPageAsRead(pageId, slackUserName) {
     console.warn(`Property "${readerCountPropertyName}" not found — skipping 既読数 update`);
   }
 
-  if (Object.keys(updates).length > 0) {
-    await notion.pages.update({ page_id: pageId, properties: updates });
+  // 既読者と既読数を別々に更新し、片方の失敗が片方に影響しないようにする
+  const readersUpdate = updates[readersPropertyName]
+    ? { [readersPropertyName]: updates[readersPropertyName] } : null;
+  const countUpdate = updates[readerCountPropertyName]
+    ? { [readerCountPropertyName]: updates[readerCountPropertyName] } : null;
+
+  if (readersUpdate) {
+    await notion.pages.update({ page_id: pageId, properties: readersUpdate });
+    console.log(`Updated "${readersPropertyName}" for page ${pageId}`);
+  }
+  if (countUpdate) {
+    await notion.pages.update({ page_id: pageId, properties: countUpdate });
+    console.log(`Updated "${readerCountPropertyName}" for page ${pageId}`);
+  }
+  if (!readersUpdate && !countUpdate) {
+    console.warn(`No updatable read properties found for page ${pageId}`);
+  } else {
     console.log(`Marked page ${pageId} as read by ${slackUserName}`);
   }
 }
