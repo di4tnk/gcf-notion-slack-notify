@@ -22,7 +22,68 @@ async function initializeNotionClient() {
   return notionClient;
 }
 
-// ページ本体のブロックからテキストを抽出して返す（最大 maxLength 文字）
+// Notionのボタン「Webhookを送信する」ペイロードからページIDを抽出する。
+// 複数の候補パスを順に探し、最初に見つかったUUID形式の値を返す。
+// 見つからない場合は null を返す。
+function extractPageIdFromWebhookPayload(body) {
+  if (!body || typeof body !== 'object') return null;
+
+  function isValidId(v) {
+    return typeof v === 'string' &&
+      /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i.test(v);
+  }
+
+  function normalizeId(id) {
+    const h = id.replace(/-/g, '');
+    return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+  }
+
+  function extractFromUrl(url) {
+    if (typeof url !== 'string') return null;
+    // UUID形式
+    const m = url.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (m) return m[0];
+    // ハイフンなし32文字（Notionページ URL末尾）
+    const m2 = url.match(/([0-9a-f]{32})(?:[?#]|$)/i);
+    if (m2) return normalizeId(m2[1]);
+    return null;
+  }
+
+  // 直接IDフィールドを探す（候補パスを順に試す）
+  const idCandidates = [
+    body?.data?.id,
+    body?.id,
+    body?.page?.id,
+    body?.data?.page?.id,
+  ];
+  for (const c of idCandidates) {
+    if (isValidId(c)) {
+      const id = normalizeId(c);
+      console.log(`extractPageIdFromWebhookPayload: found id "${id}"`);
+      return id;
+    }
+  }
+
+  // URLフィールドからIDを抽出
+  const urls = [
+    body?.data?.url,
+    body?.url,
+    body?.data?.public_url,
+    body?.public_url,
+  ];
+  for (const url of urls) {
+    const id = extractFromUrl(url);
+    if (id) {
+      console.log(`extractPageIdFromWebhookPayload: extracted id "${id}" from url`);
+      return id;
+    }
+  }
+
+  console.log('extractPageIdFromWebhookPayload: no page ID found in payload');
+  return null;
+}
+
+// ページブロックからテキストを抽出して返す（最大 maxLength 文字）
 async function getPageBodyExcerpt(pageId, maxLength = 200) {
   try {
     const notion = await initializeNotionClient();
@@ -30,8 +91,6 @@ async function getPageBodyExcerpt(pageId, maxLength = 200) {
 
     const parts = [];
     for (const block of response.results) {
-      // paragraph / heading_1-3 / bulleted_list_item / numbered_list_item / quote / callout
-      // は全て block[block.type].rich_text を持つ
       const richText = block[block.type]?.rich_text;
       if (richText && richText.length > 0) {
         const text = richText.map(t => t.plain_text).join('').trim();
@@ -49,6 +108,61 @@ async function getPageBodyExcerpt(pageId, maxLength = 200) {
   }
 }
 
+// Notionページオブジェクト → 通知用データ変換（内部ヘルパー）
+async function pageToData(page) {
+  const noticeProperty = page.properties['お知らせ'];
+  let title = 'Untitled';
+
+  if (noticeProperty) {
+    if (noticeProperty.type === 'title' && noticeProperty.title.length > 0) {
+      title = noticeProperty.title.map(t => t.plain_text).join('');
+    } else if (noticeProperty.type === 'rich_text' && noticeProperty.rich_text.length > 0) {
+      title = noticeProperty.rich_text.map(t => t.plain_text).join('');
+    }
+  }
+  if (title === 'Untitled') {
+    const fallback = page.properties['Name'] || page.properties['Title'] || page.properties['タイトル'];
+    if (fallback?.type === 'title' && fallback.title.length > 0) {
+      title = fallback.title.map(t => t.plain_text).join('');
+    }
+  }
+
+  const kindProp = page.properties['種別'];
+  const kind = kindProp?.type === 'select' && kindProp.select ? kindProp.select.name : null;
+
+  const importanceProp = page.properties['重要度'];
+  const importance = importanceProp?.type === 'select' && importanceProp.select
+    ? importanceProp.select.name : null;
+
+  const body = await getPageBodyExcerpt(page.id);
+
+  return { id: page.id, title, url: page.url, lastEditedTime: page.last_edited_time, body, kind, importance };
+}
+
+// ページIDを指定して1ページ取得し、未通知ならデータを返す。通知済みなら null を返す。
+async function getPageById(pageId) {
+  try {
+    const notion = await initializeNotionClient();
+    const page = await notion.pages.retrieve({ page_id: pageId });
+
+    const lastNotifiedPropertyName = process.env.NOTION_LAST_NOTIFIED_PROPERTY || '最終通知日時';
+    const lastNotifiedProp = page.properties[lastNotifiedPropertyName];
+
+    if (lastNotifiedProp?.date?.start) {
+      console.log(`Page ${pageId} already notified at ${lastNotifiedProp.date.start} — skipping`);
+      return null;
+    }
+
+    console.log(`Page ${pageId} is unnotified — preparing notification`);
+    return await pageToData(page);
+  } catch (err) {
+    console.error(`Failed to retrieve page ${pageId}:`, err.message);
+    return null;
+  }
+}
+
+// フォールバック: 最終通知日時が空のページをDBクエリで取得する。
+// 「通知する」チェックボックスは条件に使わない。
 async function getNotionPages() {
   try {
     const notion = await initializeNotionClient();
@@ -62,72 +176,16 @@ async function getNotionPages() {
       }
     }
 
-    const databaseInfo = await notion.databases.retrieve({ database_id: databaseId });
-    console.log('Database properties:', Object.keys(databaseInfo.properties));
-
-    // 「通知する」チェックボックスプロパティを特定
-    const notifyPropertyName = process.env.NOTION_NOTIFY_PROPERTY || '通知する';
-    if (!databaseInfo.properties[notifyPropertyName]) {
-      throw new Error(`チェックボックスプロパティ "${notifyPropertyName}" が見つかりません`);
-    }
-
-    // 「最終通知日時」の存在確認
     const lastNotifiedPropertyName = process.env.NOTION_LAST_NOTIFIED_PROPERTY || '最終通知日時';
-    const hasLastNotifiedProp = !!databaseInfo.properties[lastNotifiedPropertyName];
-    if (!hasLastNotifiedProp) {
-      console.warn(`"${lastNotifiedPropertyName}" が見つかりません。重複送信ガードが無効になります。`);
-    }
 
-    // 「通知する=ON かつ 最終通知日時が空（未通知）」を抽出
-    const filter = hasLastNotifiedProp
-      ? {
-          and: [
-            { property: notifyPropertyName, checkbox: { equals: true } },
-            { property: lastNotifiedPropertyName, date: { is_empty: true } }
-          ]
-        }
-      : { property: notifyPropertyName, checkbox: { equals: true } };
+    const response = await notion.databases.query({
+      database_id: databaseId,
+      filter: { property: lastNotifiedPropertyName, date: { is_empty: true } }
+    });
+    console.log(`Found ${response.results.length} unnotified pages (fallback query)`);
 
-    const response = await notion.databases.query({ database_id: databaseId, filter });
-    console.log(`Found ${response.results.length} pages to notify`);
-
-    // 各ページの本文を並列取得（API呼び出しを最小化）
-    const pages = await Promise.all(response.results.map(async page => {
-      // タイトル抽出
-      const noticeProperty = page.properties['お知らせ'];
-      let title = 'Untitled';
-
-      if (noticeProperty) {
-        if (noticeProperty.type === 'title' && noticeProperty.title.length > 0) {
-          title = noticeProperty.title.map(t => t.plain_text).join('');
-        } else if (noticeProperty.type === 'rich_text' && noticeProperty.rich_text.length > 0) {
-          title = noticeProperty.rich_text.map(t => t.plain_text).join('');
-        }
-      }
-      if (title === 'Untitled') {
-        const fallback = page.properties['Name'] || page.properties['Title'] || page.properties['タイトル'];
-        if (fallback && fallback.type === 'title' && fallback.title.length > 0) {
-          title = fallback.title.map(t => t.plain_text).join('');
-        }
-      }
-
-      // 種別（select）
-      const kindProp = page.properties['種別'];
-      const kind = kindProp?.type === 'select' && kindProp.select ? kindProp.select.name : null;
-
-      // 重要度（select）
-      const importanceProp = page.properties['重要度'];
-      const importance = importanceProp?.type === 'select' && importanceProp.select
-        ? importanceProp.select.name : null;
-
-      // ページ本文の要点を取得
-      const body = await getPageBodyExcerpt(page.id);
-
-      return { id: page.id, title, url: page.url, lastEditedTime: page.last_edited_time, body, kind, importance };
-    }));
-
+    const pages = await Promise.all(response.results.map(pageToData));
     return pages;
-
   } catch (error) {
     console.error('Error fetching Notion pages:', error);
     throw new Error(`Failed to fetch Notion pages: ${error.message}`);
@@ -164,7 +222,6 @@ async function markPageAsRead(pageId, slackUserName) {
         ? readersProp.rich_text.map(t => t.plain_text).join('')
         : '';
 
-      // 重複チェック（カンマ区切りで名前が既に含まれていればスキップ）
       const names = current.split(',').map(s => s.trim()).filter(Boolean);
       if (names.includes(slackUserName)) {
         console.log(`${slackUserName} already in 既読者 — skipping duplicate`);
@@ -216,4 +273,10 @@ async function markPageAsRead(pageId, slackUserName) {
   return { readerCount: newCount, readers: newReaders };
 }
 
-module.exports = { getNotionPages, updateLastNotifiedAt, markPageAsRead };
+module.exports = {
+  extractPageIdFromWebhookPayload,
+  getPageById,
+  getNotionPages,
+  updateLastNotifiedAt,
+  markPageAsRead
+};
