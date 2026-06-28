@@ -4,7 +4,17 @@
       "Bash(mkdir:*)",
       "Bash(tree:*)",
       "Bash(find:*)",
-      "Bash(npm install)"
+      "Bash(npm install)",
+      "Bash(GIT_PAGER=cat git --no-pager diff)",
+      "Bash(gcloud auth *)",
+      "Bash(gcloud config *)",
+      "Bash(gcloud functions *)",
+      "Bash(gcloud scheduler *)",
+      "Bash(GIT_PAGER=cat git --no-pager status)",
+      "Bash(GIT_PAGER=cat git --no-pager log --oneline -5)",
+      "Bash(GIT_PAGER=cat git --no-pager branch -vv)",
+      "Bash(GIT_PAGER=cat git --no-pager add .claude/settings.local.json DEPLOY.md SLACK_APP_SETUP.md src/index.js src/interactive.js src/notion.js src/slack.js)",
+      "Bash(git commit -m ' *)"
     ],
     "deny": []
   }

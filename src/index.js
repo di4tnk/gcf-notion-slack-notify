@@ -1,15 +1,26 @@
 const functions = require('@google-cloud/functions-framework');
-const { getNotionPages } = require('./notion');
-const { sendSlackNotifications } = require('./slack');
+const { getNotionPages, getPageById, extractPageIdFromWebhookPayload } = require('./notion');
+const { sendSlackNotifications, sendReminderNotifications } = require('./slack');
 const { verifySlackRequest, handleSlackInteraction } = require('./interactive');
 
 functions.http('notifySlack', async (req, res) => {
+  // リマインダータスク（Cloud Scheduler から ?task=reminder で叩かれる）
+  if (req.query.task === 'reminder') {
+    try {
+      console.log('Starting reminder task...');
+      const result = await sendReminderNotifications();
+      return res.status(200).json({ message: 'リマインダー処理完了', ...result });
+    } catch (error) {
+      console.error('Error in reminder task:', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
   // Slackインタラクティブ要素の処理（ボタンクリック時）
   if (req.method === 'POST' && req.body && req.body.payload) {
     const timestamp = req.headers['x-slack-request-timestamp'];
     const signature = req.headers['x-slack-signature'];
 
-    // Slackの署名検証にはHTTPリクエストの生のbody文字列が必要。
     // GCFはreq.rawBodyを提供する。ローカルdevではurlencoded形式に再構築する。
     const rawBody = req.rawBody
       ? req.rawBody.toString('utf8')
@@ -27,35 +38,48 @@ functions.http('notifySlack', async (req, res) => {
       return res.status(400).json({ error: 'Bad request' });
     }
 
-    // Slackは3秒以内のレスポンスを要求する。
-    // Notion API呼び出し(3回)を含む処理は3秒を超えるため、先に200を返してから
-    // 非同期でNotionを更新しresponse_urlでSlackメッセージを書き換える。
+    // Slackは3秒以内のレスポンスを要求するため先に200を返し、非同期で処理する
     res.status(200).send('');
-
     handleSlackInteraction(payload).catch(err => {
       console.error('Error in handleSlackInteraction:', err);
     });
     return;
   }
 
-  // 通常の通知処理（Notionオートメーション or 手動HTTPトリガー）
+  // 通知処理: Notionボタン（Webhookを送信する）または手動トリガー
   try {
-    console.log('Starting Notion to Slack notification process...');
+    console.log('Starting notification process...');
+    console.log('Request body:', JSON.stringify(req.body));
 
-    const checkedPages = await getNotionPages();
+    let pages;
+    const pageId = extractPageIdFromWebhookPayload(req.body);
 
-    if (checkedPages.length === 0) {
+    if (pageId) {
+      // ページID取得成功: そのページのみ対象（最終通知日時が空の場合のみ通知）
+      console.log(`Webhook mode: processing page ${pageId}`);
+      const page = await getPageById(pageId);
+      if (!page) {
+        return res.status(200).json({ message: '通知済みまたはページが見つかりません', count: 0 });
+      }
+      pages = [page];
+    } else {
+      // フォールバック: 最終通知日時が空のページをDBクエリで取得
+      console.log('Fallback mode: querying unnotified pages from database');
+      pages = await getNotionPages();
+    }
+
+    if (pages.length === 0) {
       console.log('No pages to notify');
       return res.status(200).json({ message: '通知対象なし', count: 0 });
     }
 
-    console.log(`Found ${checkedPages.length} pages to notify`);
-    const results = await sendSlackNotifications(checkedPages);
+    console.log(`Sending notifications for ${pages.length} page(s)`);
+    const results = await sendSlackNotifications(pages);
 
     console.log('Notification process completed');
     return res.status(200).json({
-      message: `${checkedPages.length}件の通知を送信しました`,
-      count: checkedPages.length,
+      message: `${pages.length}件の通知を送信しました`,
+      count: pages.length,
       results
     });
 
