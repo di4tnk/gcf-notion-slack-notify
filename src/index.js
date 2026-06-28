@@ -1,9 +1,21 @@
 const functions = require('@google-cloud/functions-framework');
 const { getNotionPages, getPageById, extractPageIdFromWebhookPayload } = require('./notion');
-const { sendSlackNotifications } = require('./slack');
+const { sendSlackNotifications, sendReminderNotifications } = require('./slack');
 const { verifySlackRequest, handleSlackInteraction } = require('./interactive');
 
 functions.http('notifySlack', async (req, res) => {
+  // リマインダータスク（Cloud Scheduler から ?task=reminder で叩かれる）
+  if (req.query.task === 'reminder') {
+    try {
+      console.log('Starting reminder task...');
+      const result = await sendReminderNotifications();
+      return res.status(200).json({ message: 'リマインダー処理完了', ...result });
+    } catch (error) {
+      console.error('Error in reminder task:', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
   // Slackインタラクティブ要素の処理（ボタンクリック時）
   if (req.method === 'POST' && req.body && req.body.payload) {
     const timestamp = req.headers['x-slack-request-timestamp'];

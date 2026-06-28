@@ -1,6 +1,6 @@
 const axios = require('axios');
 const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
-const { updateLastNotifiedAt } = require('./notion');
+const { updateLastNotifiedAt, getAnnouncementsWithDeadlineToday } = require('./notion');
 
 let secretManagerClient = null;
 
@@ -62,22 +62,22 @@ function buildNotificationBlocks(page) {
   // ④ 区切り線
   blocks.push({ type: 'divider' });
 
-  // ⑤ 既読ボタンの注記
+  // ⑤ 確認ボタンの注記
   blocks.push({
     type: 'context',
     elements: [{
       type: 'mrkdwn',
-      text: '※この「既読」ボタンを押すと既読になります（Notionページを開くだけではカウントされません）'
+      text: '※内容を読んだら「確認しました」ボタンを押してください。確認状況はNotionに記録されます。'
     }]
   });
 
-  // ⑥ 既読ボタン（value に Notion ページ ID をセット）
+  // ⑥ 確認ボタン（value に Notion ページ ID をセット）
   blocks.push({
     type: 'actions',
     elements: [
       {
         type: 'button',
-        text: { type: 'plain_text', text: '✅ 既読', emoji: true },
+        text: { type: 'plain_text', text: '✅ 確認しました', emoji: true },
         value: page.id,
         action_id: 'mark_read',
         style: 'primary'
@@ -138,4 +138,121 @@ async function sendSlackNotifications(pages) {
   return results;
 }
 
-module.exports = { sendSlackNotifications, buildNotificationBlocks };
+// チャンネル名からチャンネルIDを解決する（conversations.list を使用）
+// SLACK_CHANNEL_ID 環境変数が設定されていればそちらを優先する
+async function resolveChannelId(botToken, channelName) {
+  const envId = process.env.SLACK_CHANNEL_ID;
+  if (envId) return envId;
+
+  // チャンネル名がすでにID形式（C から始まる英数字）の場合はそのまま返す
+  if (/^[A-Z0-9]{8,}$/.test(channelName)) return channelName;
+
+  let cursor;
+  do {
+    const params = { limit: 200, types: 'public_channel,private_channel' };
+    if (cursor) params.cursor = cursor;
+    const res = await axios.get('https://slack.com/api/conversations.list', {
+      headers: { Authorization: `Bearer ${botToken}` },
+      params
+    });
+    if (!res.data.ok) throw new Error(`conversations.list error: ${res.data.error}`);
+    const found = res.data.channels.find(c => c.name === channelName);
+    if (found) return found.id;
+    cursor = res.data.response_metadata?.next_cursor;
+  } while (cursor);
+
+  throw new Error(`Channel "${channelName}" not found via conversations.list`);
+}
+
+// チャンネルの全メンバーIDを取得する（ページネーション対応）
+async function getChannelMembers(botToken, channelId) {
+  const members = [];
+  let cursor;
+  do {
+    const params = { channel: channelId, limit: 200 };
+    if (cursor) params.cursor = cursor;
+    const res = await axios.get('https://slack.com/api/conversations.members', {
+      headers: { Authorization: `Bearer ${botToken}` },
+      params
+    });
+    if (!res.data.ok) throw new Error(`conversations.members error: ${res.data.error}`);
+    members.push(...res.data.members);
+    cursor = res.data.response_metadata?.next_cursor;
+  } while (cursor);
+  return members;
+}
+
+// Bot・削除済みユーザーのIDセットを取得する（除外フィルタ用）
+async function getBotAndDeletedUserIds(botToken) {
+  const excludeIds = new Set();
+  let cursor;
+  do {
+    const params = { limit: 200 };
+    if (cursor) params.cursor = cursor;
+    const res = await axios.get('https://slack.com/api/users.list', {
+      headers: { Authorization: `Bearer ${botToken}` },
+      params
+    });
+    if (!res.data.ok) throw new Error(`users.list error: ${res.data.error}`);
+    for (const u of res.data.members) {
+      if (u.is_bot || u.deleted) excludeIds.add(u.id);
+    }
+    cursor = res.data.response_metadata?.next_cursor;
+  } while (cursor);
+  return excludeIds;
+}
+
+// 締切が本日のお知らせについて、未確認者へ個別メンションでリマインドを投稿する
+async function sendReminderNotifications() {
+  const botToken = await getSlackBotToken();
+  const channelName = getSlackChannel();
+
+  const pages = await getAnnouncementsWithDeadlineToday();
+  if (pages.length === 0) {
+    console.log('No announcements with deadline today — nothing to remind');
+    return { remindedCount: 0, results: [] };
+  }
+
+  const channelId = await resolveChannelId(botToken, channelName);
+  const [members, excludeIds] = await Promise.all([
+    getChannelMembers(botToken, channelId),
+    getBotAndDeletedUserIds(botToken)
+  ]);
+
+  const humanMembers = members.filter(uid => !excludeIds.has(uid));
+  console.log(`Channel ${channelId}: ${humanMembers.length} human members`);
+
+  const results = [];
+  for (const page of pages) {
+    const confirmedSet = new Set(page.confirmedIds);
+    const unconfirmed = humanMembers.filter(uid => !confirmedSet.has(uid));
+
+    if (unconfirmed.length === 0) {
+      console.log(`All members confirmed "${page.title}" — skipping reminder`);
+      results.push({ pageId: page.id, title: page.title, skipped: true });
+      continue;
+    }
+
+    const mentions = unconfirmed.map(uid => `<@${uid}>`).join(' ');
+    const text = `⏰【確認のお願い】「${page.title}」の確認期限は本日です。\n未確認: ${mentions}\nお手数ですが内容をご確認の上、対象の投稿の「確認しました」ボタンを押してください。`;
+
+    const res = await axios.post('https://slack.com/api/chat.postMessage', {
+      channel: channelId,
+      text
+    }, {
+      headers: {
+        Authorization: `Bearer ${botToken}`,
+        'Content-Type': 'application/json; charset=utf-8'
+      }
+    });
+
+    if (!res.data.ok) throw new Error(`chat.postMessage (reminder) error: ${res.data.error}`);
+
+    console.log(`Sent reminder for "${page.title}" to ${unconfirmed.length} unconfirmed members`);
+    results.push({ pageId: page.id, title: page.title, unconfirmedCount: unconfirmed.length, success: true });
+  }
+
+  return { remindedCount: results.filter(r => r.success).length, results };
+}
+
+module.exports = { sendSlackNotifications, buildNotificationBlocks, sendReminderNotifications };

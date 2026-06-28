@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const axios = require('axios');
-const { markPageAsRead } = require('./notion');
+const { markPageAsConfirmed } = require('./notion');
 
 // Slack署名検証。GCFはreq.rawBodyを提供するのでrawBodyStringを渡すこと
 function verifySlackRequest(rawBodyString, timestamp, signature) {
@@ -95,13 +95,13 @@ async function handleSlackInteraction(payload) {
   if (action.action_id === 'mark_read') {
     const pageId = action.value;
 
-    // Notionの既読者（表示名ベース重複チェック含む）・既読数を更新
+    // Notionの確認者（表示名ベース重複チェック含む）・確認数・確認者IDを更新
     let readerCount = 0;
     try {
-      const result = await markPageAsRead(pageId, userName);
+      const result = await markPageAsConfirmed(pageId, userName, user.id);
       readerCount = result.readerCount;
     } catch (err) {
-      console.error('Failed to update Notion read status:', err.message);
+      console.error('Failed to update Notion confirmation status:', err.message);
     }
 
     // 元のブロックから actions を除去し、context フィードバックを末尾に追加
@@ -112,7 +112,7 @@ async function handleSlackInteraction(payload) {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: `✅ *${userName}* が既読マークしました（既読 ${readerCount}人）`
+          text: `✅ *${userName}* が確認しました（確認済み ${readerCount}人）`
         }]
       }
     ];
@@ -128,7 +128,7 @@ async function handleSlackInteraction(payload) {
       await axios.post(response_url, {
         response_type: 'in_channel',
         replace_original: true,
-        text: `✅ ${userName} が既読マークしました（既読 ${readerCount}人）`,
+        text: `✅ ${userName} が確認しました（確認済み ${readerCount}人）`,
         blocks: updatedBlocks
       });
       console.log(`Slack message updated via response_url (page: ${pageId}, user: ${userName}, count: ${readerCount})`);

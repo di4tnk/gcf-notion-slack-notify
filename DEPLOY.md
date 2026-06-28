@@ -87,12 +87,14 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 ※ アシスタントが画面操作:
 > Notionのお知らせデータベースに以下のプロパティが存在することを確認し、なければ追加する:
 >
-> | プロパティ名 | 型 |
-> |-------------|-----|
-> | `通知する` | チェックボックス |
-> | `最終通知日時` | 日付 |
-> | `既読者` | テキスト（リッチテキスト） |
-> | `既読数` | 数値 |
+> | プロパティ名 | 型 | 備考 |
+> |-------------|-----|------|
+> | `通知する` | チェックボックス | |
+> | `最終通知日時` | 日付 | |
+> | `締切` | 日付 | リマインダー機能で参照 |
+> | `確認者` | テキスト（リッチテキスト） | 旧「既読者」をリネーム |
+> | `確認数` | 数値 | 旧「既読数」をリネーム |
+> | `確認者ID` | テキスト（リッチテキスト） | Slack ユーザーID をカンマ区切りで蓄積（画面非表示推奨） |
 
 ### 4-4. データベースにインテグレーションを接続する
 
@@ -112,7 +114,9 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 > 3. 左メニュー「**OAuth & Permissions**」→「**Bot Token Scopes**」に以下を追加:
 >    - `chat:write`
 >    - `chat:write.public`
-> 4. 「**Install to Workspace**」→ 権限を承認
+>    - `users:read`
+>    - `channels:read`（通知先がプライベートチャンネルの場合は `groups:read` も追加）
+> 4. スコープ追加後「**Install to Workspace**」→ 権限を承認（**再インストール必要**）
 > 5. 表示された **Bot User OAuth Token（`xoxb-...`）** をコピーしておく
 
 ### 5-2. Signing Secret を取得する
@@ -255,13 +259,27 @@ curl -X POST "$FUNCTION_URL" && echo ""
 ### 12-3. 確認ポイント
 
 - [ ] Slack に `📢 〔タイトル〕` の通知が届く
-- [ ] 「✅ 既読」ボタンが表示されている
+- [ ] 「✅ 確認しました」ボタンが表示されている
 - [ ] 「Open in Notion」ボタンが表示されている
-- [ ] 「✅ 既読」を押すと「〇〇が既読マークしました」にメッセージが置き換わる
-- [ ] Notion の `既読者` に名前が記録される
-- [ ] Notion の `既読数` が 1 になる
+- [ ] 「✅ 確認しました」を押すと「〇〇が確認しました（確認済み 1人）」にメッセージが置き換わる
+- [ ] Notion の `確認者` に名前が記録される
+- [ ] Notion の `確認数` が 1 になる
+- [ ] Notion の `確認者ID` に Slack ユーザーID が記録される
 - [ ] Notion の `最終通知日時` に時刻が記録される
 - [ ] 同じ行でもう一度オートメーションを発火しても **二重送信されない**
+
+### 12-4. リマインダーの手動テスト
+
+```bash
+FUNCTION_URL=$(gcloud functions describe notion-slack-notify \
+  --region asia-northeast1 \
+  --format='value(serviceConfig.uri)')
+
+# 締切が本日のお知らせに対してリマインダーを実行
+curl -X GET "${FUNCTION_URL}?task=reminder" && echo ""
+```
+
+> 締切が本日のお知らせが Notion DB にあり、未確認者がいる場合に Slack へメンション付き投稿が届けば成功です。
 
 ---
 
@@ -287,6 +305,66 @@ gcloud functions deploy notion-slack-notify \
 
 ---
 
+## STEP 14 — 再デプロイ（スコープ追加・コード変更後）
+
+Slack スコープ追加・コード変更後は以下のコマンドで再デプロイします。
+
+```bash
+PROJECT_ID=$(gcloud config get-value project)
+
+# テスト環境（development-test）
+gcloud functions deploy notion-slack-notify \
+  --gen2 \
+  --runtime nodejs20 \
+  --region asia-northeast1 \
+  --trigger-http \
+  --entry-point notifySlack \
+  --source . \
+  --allow-unauthenticated \
+  --timeout 60s \
+  --memory 256Mi \
+  --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},SLACK_CHANNEL=development-test"
+
+# 本番環境（general-announcements）へ切り替える場合
+# --set-env-vars の SLACK_CHANNEL を general-announcements に変更して実行
+```
+
+> **SLACK_CHANNEL_ID について**: `conversations.members` はチャンネルIDが必要です。  
+> 指定しない場合はコードが `conversations.list` でチャンネル名からIDを自動解決します。  
+> チャンネル数が多い場合やパフォーマンスを優先する場合は環境変数に追加してください:
+> ```bash
+> --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},SLACK_CHANNEL=general-announcements,SLACK_CHANNEL_ID=C0XXXXXXXXX"
+> ```
+> チャンネルIDはSlackアプリでチャンネルを右クリック →「チャンネルの詳細を表示」→ 最下部に表示されます。
+
+---
+
+## STEP 15 — Cloud Scheduler ジョブを作成する（リマインダー自動実行）
+
+締切当日の JST 10:00 に自動でリマインダーを実行するジョブを作成します。
+
+```bash
+FUNCTION_URL=$(gcloud functions describe notion-slack-notify \
+  --region asia-northeast1 \
+  --format='value(serviceConfig.uri)')
+
+gcloud scheduler jobs create http notion-slack-reminder \
+  --location asia-northeast1 \
+  --schedule "0 10 * * *" \
+  --time-zone "Asia/Tokyo" \
+  --uri "${FUNCTION_URL}?task=reminder" \
+  --http-method GET \
+  --description "毎日JST10:00に締切当日のお知らせの未確認者へリマインダーを送信"
+```
+
+> ジョブが作成済みで設定を変更する場合は `create` を `update` に変えて実行してください。  
+> 手動でジョブを即時実行するには:
+> ```bash
+> gcloud scheduler jobs run notion-slack-reminder --location asia-northeast1
+> ```
+
+---
+
 ## トラブルシュート
 
 | エラー | 原因・対処 |
@@ -295,4 +373,7 @@ gcloud functions deploy notion-slack-notify \
 | `Unauthorized` (401) | `SLACK_SIGNING_SECRET` が Secret Manager に登録されていない or Interactivity URL が未設定 |
 | `NOTION_DATABASE_ID not found` | `.env` の値が空か、`./register-secrets.sh` が未実行 |
 | デプロイ時 `Permission denied` | STEP 3 の IAM 権限付与が未完了 |
-| 既読ボタンを押しても Notion が更新されない | Notion DB に `既読者`/`既読数` プロパティが存在しない → STEP 4-3 を確認 |
+| 確認ボタンを押しても Notion が更新されない | Notion DB に `確認者`/`確認数`/`確認者ID` プロパティが存在しない → STEP 4-3 を確認 |
+| `conversations.list error: missing_scope` | Bot に `channels:read` スコープが付いていない → STEP 5-1 を再確認し再インストール |
+| `conversations.members error: missing_scope` | 同上 |
+| Channel "..." not found | `SLACK_CHANNEL` の値がチャンネル名と一致しているか確認、または `SLACK_CHANNEL_ID` を明示的に設定 |

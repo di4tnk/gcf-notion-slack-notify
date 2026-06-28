@@ -203,18 +203,19 @@ async function updateLastNotifiedAt(pageId) {
   console.log(`Updated "${propertyName}" for page ${pageId}`);
 }
 
-// 既読ボタン押下時に既読者・既読数をNotionに反映し、新しい値を返す
-async function markPageAsRead(pageId, slackUserName) {
+// 確認ボタン押下時に確認者・確認数・確認者IDをNotionに反映し、新しい値を返す
+async function markPageAsConfirmed(pageId, slackUserName, slackUserId) {
   const notion = await initializeNotionClient();
   const page = await notion.pages.retrieve({ page_id: pageId });
 
-  const readersPropertyName = process.env.NOTION_READERS_PROPERTY || '既読者';
-  const readerCountPropertyName = process.env.NOTION_READER_COUNT_PROPERTY || '既読数';
+  const readersPropertyName = process.env.NOTION_READERS_PROPERTY || '確認者';
+  const readerCountPropertyName = process.env.NOTION_READER_COUNT_PROPERTY || '確認数';
+  const confirmedIdsPropertyName = process.env.NOTION_CONFIRMED_IDS_PROPERTY || '確認者ID';
 
   let newReaders = '';
   let newCount = 0;
 
-  // ── 既読者 (rich_text) ─────────────────────────────
+  // ── 確認者 (rich_text) ────────────────────────────
   const readersProp = page.properties[readersPropertyName];
   if (readersProp) {
     if (readersProp.type === 'rich_text') {
@@ -224,7 +225,7 @@ async function markPageAsRead(pageId, slackUserName) {
 
       const names = current.split(',').map(s => s.trim()).filter(Boolean);
       if (names.includes(slackUserName)) {
-        console.log(`${slackUserName} already in 既読者 — skipping duplicate`);
+        console.log(`${slackUserName} already in 確認者 — skipping duplicate`);
         newReaders = current;
       } else {
         newReaders = current ? `${current}, ${slackUserName}` : slackUserName;
@@ -243,10 +244,10 @@ async function markPageAsRead(pageId, slackUserName) {
       console.warn(`"${readersPropertyName}" is type "${readersProp.type}" (not rich_text) — skipping`);
     }
   } else {
-    console.warn(`"${readersPropertyName}" not found — skipping 既読者 update`);
+    console.warn(`"${readersPropertyName}" not found — skipping 確認者 update`);
   }
 
-  // ── 既読数 (number) ────────────────────────────────
+  // ── 確認数 (number) ───────────────────────────────
   const countProp = page.properties[readerCountPropertyName];
   if (countProp) {
     if (countProp.type === 'number') {
@@ -266,11 +267,73 @@ async function markPageAsRead(pageId, slackUserName) {
       console.warn(`"${readerCountPropertyName}" is type "${countProp.type}" (not number) — skipping`);
     }
   } else {
-    console.warn(`"${readerCountPropertyName}" not found — skipping 既読数 update`);
+    console.warn(`"${readerCountPropertyName}" not found — skipping 確認数 update`);
   }
 
-  console.log(`Marked page ${pageId} as read by ${slackUserName}`);
+  // ── 確認者ID (rich_text) — カンマ区切りで蓄積 ────
+  if (slackUserId) {
+    const confirmedIdsProp = page.properties[confirmedIdsPropertyName];
+    if (confirmedIdsProp?.type === 'rich_text') {
+      const current = confirmedIdsProp.rich_text.length > 0
+        ? confirmedIdsProp.rich_text.map(t => t.plain_text).join('')
+        : '';
+      const ids = current.split(',').map(s => s.trim()).filter(Boolean);
+      if (!ids.includes(slackUserId)) {
+        const newIds = ids.length > 0 ? `${current},${slackUserId}` : slackUserId;
+        try {
+          await notion.pages.update({
+            page_id: pageId,
+            properties: { [confirmedIdsPropertyName]: { rich_text: [{ text: { content: newIds } }] } }
+          });
+          console.log(`Updated "${confirmedIdsPropertyName}" for page ${pageId}`);
+        } catch (err) {
+          console.warn(`Failed to update "${confirmedIdsPropertyName}":`, err.message);
+        }
+      } else {
+        console.log(`${slackUserId} already in 確認者ID — skipping duplicate`);
+      }
+    } else {
+      console.warn(`"${confirmedIdsPropertyName}" not found or not rich_text — skipping 確認者ID update`);
+    }
+  }
+
+  console.log(`Marked page ${pageId} as confirmed by ${slackUserName} (${slackUserId})`);
   return { readerCount: newCount, readers: newReaders };
+}
+
+// 本日（Asia/Tokyo）が締切のお知らせを取得する（リマインダー用）
+// 各ページに confirmedIds（確認者IDの配列）を付与して返す
+async function getAnnouncementsWithDeadlineToday() {
+  const notion = await initializeNotionClient();
+  let databaseId = process.env.NOTION_DATABASE_ID;
+  if (!databaseId) {
+    try {
+      databaseId = await getSecret('NOTION_DATABASE_ID');
+    } catch {
+      throw new Error('NOTION_DATABASE_ID not found in environment variables or Secret Manager');
+    }
+  }
+
+  // Asia/Tokyo (UTC+9) での今日の日付
+  const todayJST = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const deadlinePropertyName = process.env.NOTION_DEADLINE_PROPERTY || '締切';
+  const confirmedIdsPropertyName = process.env.NOTION_CONFIRMED_IDS_PROPERTY || '確認者ID';
+
+  const response = await notion.databases.query({
+    database_id: databaseId,
+    filter: { property: deadlinePropertyName, date: { equals: todayJST } }
+  });
+  console.log(`Found ${response.results.length} pages with deadline today (${todayJST})`);
+
+  return await Promise.all(response.results.map(async (page) => {
+    const data = await pageToData(page);
+    const confirmedIdsProp = page.properties[confirmedIdsPropertyName];
+    const confirmedIdsStr = confirmedIdsProp?.type === 'rich_text' && confirmedIdsProp.rich_text.length > 0
+      ? confirmedIdsProp.rich_text.map(t => t.plain_text).join('')
+      : '';
+    const confirmedIds = confirmedIdsStr.split(',').map(s => s.trim()).filter(Boolean);
+    return { ...data, confirmedIds };
+  }));
 }
 
 module.exports = {
@@ -278,5 +341,6 @@ module.exports = {
   getPageById,
   getNotionPages,
   updateLastNotifiedAt,
-  markPageAsRead
+  markPageAsConfirmed,
+  getAnnouncementsWithDeadlineToday
 };
