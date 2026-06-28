@@ -86,16 +86,30 @@ async function handleSlackInteraction(payload) {
 
   const action = actions[0];
 
-  // block_actions ペイロードの user オブジェクトは id / username / name / team_id のみ。
-  // real_name はペイロードに含まれないため users.info API で取得する（users:read スコープ必要）。
-  // API失敗時は payload の user.name にフォールバック。
-  const payloadFallback = user.name || user.username || user.id;
-  const userName = await fetchSlackDisplayName(user.id, payloadFallback);
-
   if (action.action_id === 'mark_read') {
     const pageId = action.value;
 
-    // Notionの確認者（表示名ベース重複チェック含む）・確認数・確認者IDを更新
+    if (!response_url) {
+      console.warn('No response_url in payload — cannot update Slack message');
+      return;
+    }
+
+    // ① 即時 ephemeral フィードバック（連打防止: 押した瞬間に手応えを返す）
+    try {
+      await axios.post(response_url, {
+        response_type: 'ephemeral',
+        replace_original: false,
+        text: '✅ 確認を受け付けました（反映まで数秒かかることがあります）'
+      });
+    } catch (err) {
+      console.warn('Failed to send ephemeral ack:', err.message);
+    }
+
+    // ② 表示名取得（users.info — users:read スコープ必要）
+    const payloadFallback = user.name || user.username || user.id;
+    const userName = await fetchSlackDisplayName(user.id, payloadFallback);
+
+    // ③ Notion 更新（冪等: 同一ユーザーの連打でも確認数は増えない）
     let readerCount = 0;
     try {
       const result = await markPageAsConfirmed(pageId, userName, user.id);
@@ -104,7 +118,7 @@ async function handleSlackInteraction(payload) {
       console.error('Failed to update Notion confirmation status:', err.message);
     }
 
-    // 元のブロックから actions を除去し、context フィードバックを末尾に追加
+    // ④ 元メッセージをボタン除去＋確認済みフィードバックに置き換え
     const originalBlocks = message?.blocks ?? [];
     const updatedBlocks = [
       ...originalBlocks.filter(b => b.type !== 'actions'),
@@ -116,13 +130,6 @@ async function handleSlackInteraction(payload) {
         }]
       }
     ];
-
-    // response_url に POST してSlackメッセージを更新
-    // (HTTPレスポンスボディではなくこちらが確実に反映される)
-    if (!response_url) {
-      console.warn('No response_url in payload — cannot update Slack message');
-      return;
-    }
 
     try {
       await axios.post(response_url, {

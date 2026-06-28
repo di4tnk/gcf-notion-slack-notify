@@ -203,101 +203,74 @@ async function updateLastNotifiedAt(pageId) {
   console.log(`Updated "${propertyName}" for page ${pageId}`);
 }
 
-// 確認ボタン押下時に確認者・確認数・確認者IDをNotionに反映し、新しい値を返す
+// 確認ボタン押下時に確認者・確認数・確認者IDをNotionに反映し、新しい値を返す。
+// 冪等設計: 確認者ID の Set を正とし、確認数 = Set のサイズで上書きする。
+// 同一ユーザーが連打しても確認数は増えない。
 async function markPageAsConfirmed(pageId, slackUserName, slackUserId) {
   const notion = await initializeNotionClient();
+  // 書き込み直前に最新状態を取得（連打で古い値を読まないよう）
   const page = await notion.pages.retrieve({ page_id: pageId });
 
   const readersPropertyName = process.env.NOTION_READERS_PROPERTY || '確認者';
   const readerCountPropertyName = process.env.NOTION_READER_COUNT_PROPERTY || '確認数';
   const confirmedIdsPropertyName = process.env.NOTION_CONFIRMED_IDS_PROPERTY || '確認者ID';
 
-  let newReaders = '';
-  let newCount = 0;
+  // ── 確認者ID から現在のユニークID集合を構築 ──────
+  const confirmedIdsProp = page.properties[confirmedIdsPropertyName];
+  const currentIdsStr = confirmedIdsProp?.type === 'rich_text' && confirmedIdsProp.rich_text.length > 0
+    ? confirmedIdsProp.rich_text.map(t => t.plain_text).join('')
+    : '';
+  const uniqueIds = new Set(currentIdsStr.split(',').map(s => s.trim()).filter(Boolean));
 
-  // ── 確認者 (rich_text) ────────────────────────────
+  // 既に確認済みなら書き込みをスキップして現在値を返す（冪等）
+  if (slackUserId && uniqueIds.has(slackUserId)) {
+    const readersProp = page.properties[readersPropertyName];
+    const currentReaders = readersProp?.type === 'rich_text' && readersProp.rich_text.length > 0
+      ? readersProp.rich_text.map(t => t.plain_text).join('')
+      : '';
+    console.log(`${slackUserId} already confirmed page ${pageId} — skipping (idempotent), count: ${uniqueIds.size}`);
+    return { readerCount: uniqueIds.size, readers: currentReaders };
+  }
+
+  // 新しいID・表示名の集合を構築
+  if (slackUserId) uniqueIds.add(slackUserId);
+  const newIdsStr = [...uniqueIds].join(',');
+  const newCount = uniqueIds.size;
+
   const readersProp = page.properties[readersPropertyName];
-  if (readersProp) {
-    if (readersProp.type === 'rich_text') {
-      const current = readersProp.rich_text.length > 0
-        ? readersProp.rich_text.map(t => t.plain_text).join('')
-        : '';
+  const currentNamesStr = readersProp?.type === 'rich_text' && readersProp.rich_text.length > 0
+    ? readersProp.rich_text.map(t => t.plain_text).join('')
+    : '';
+  const uniqueNames = new Set(currentNamesStr.split(',').map(s => s.trim()).filter(Boolean));
+  uniqueNames.add(slackUserName);
+  const newReaders = [...uniqueNames].join(', ');
 
-      const names = current.split(',').map(s => s.trim()).filter(Boolean);
-      if (names.includes(slackUserName)) {
-        console.log(`${slackUserName} already in 確認者 — skipping duplicate`);
-        newReaders = current;
-      } else {
-        newReaders = current ? `${current}, ${slackUserName}` : slackUserName;
-        try {
-          await notion.pages.update({
-            page_id: pageId,
-            properties: { [readersPropertyName]: { rich_text: [{ text: { content: newReaders } }] } }
-          });
-          console.log(`Updated "${readersPropertyName}" for page ${pageId}`);
-        } catch (err) {
-          console.warn(`Failed to update "${readersPropertyName}":`, err.message);
-          newReaders = current;
-        }
-      }
-    } else {
-      console.warn(`"${readersPropertyName}" is type "${readersProp.type}" (not rich_text) — skipping`);
-    }
+  // 3プロパティを1回の API 呼び出しでまとめて更新
+  const updates = {};
+  if (confirmedIdsProp?.type === 'rich_text') {
+    updates[confirmedIdsPropertyName] = { rich_text: [{ text: { content: newIdsStr } }] };
   } else {
-    console.warn(`"${readersPropertyName}" not found — skipping 確認者 update`);
+    console.warn(`"${confirmedIdsPropertyName}" not found or not rich_text — skipping`);
   }
-
-  // ── 確認数 (number) ───────────────────────────────
-  const countProp = page.properties[readerCountPropertyName];
-  if (countProp) {
-    if (countProp.type === 'number') {
-      const current = countProp.number !== null ? countProp.number : 0;
-      newCount = current + 1;
-      try {
-        await notion.pages.update({
-          page_id: pageId,
-          properties: { [readerCountPropertyName]: { number: newCount } }
-        });
-        console.log(`Updated "${readerCountPropertyName}" to ${newCount} for page ${pageId}`);
-      } catch (err) {
-        console.warn(`Failed to update "${readerCountPropertyName}":`, err.message);
-        newCount = current;
-      }
-    } else {
-      console.warn(`"${readerCountPropertyName}" is type "${countProp.type}" (not number) — skipping`);
-    }
+  if (readersProp?.type === 'rich_text') {
+    updates[readersPropertyName] = { rich_text: [{ text: { content: newReaders } }] };
   } else {
-    console.warn(`"${readerCountPropertyName}" not found — skipping 確認数 update`);
+    console.warn(`"${readersPropertyName}" not found or not rich_text — skipping`);
+  }
+  if (page.properties[readerCountPropertyName]?.type === 'number') {
+    updates[readerCountPropertyName] = { number: newCount };
+  } else {
+    console.warn(`"${readerCountPropertyName}" not found or not number — skipping`);
   }
 
-  // ── 確認者ID (rich_text) — カンマ区切りで蓄積 ────
-  if (slackUserId) {
-    const confirmedIdsProp = page.properties[confirmedIdsPropertyName];
-    if (confirmedIdsProp?.type === 'rich_text') {
-      const current = confirmedIdsProp.rich_text.length > 0
-        ? confirmedIdsProp.rich_text.map(t => t.plain_text).join('')
-        : '';
-      const ids = current.split(',').map(s => s.trim()).filter(Boolean);
-      if (!ids.includes(slackUserId)) {
-        const newIds = ids.length > 0 ? `${current},${slackUserId}` : slackUserId;
-        try {
-          await notion.pages.update({
-            page_id: pageId,
-            properties: { [confirmedIdsPropertyName]: { rich_text: [{ text: { content: newIds } }] } }
-          });
-          console.log(`Updated "${confirmedIdsPropertyName}" for page ${pageId}`);
-        } catch (err) {
-          console.warn(`Failed to update "${confirmedIdsPropertyName}":`, err.message);
-        }
-      } else {
-        console.log(`${slackUserId} already in 確認者ID — skipping duplicate`);
-      }
-    } else {
-      console.warn(`"${confirmedIdsPropertyName}" not found or not rich_text — skipping 確認者ID update`);
-    }
+  try {
+    await notion.pages.update({ page_id: pageId, properties: updates });
+    console.log(`Confirmed page ${pageId} by ${slackUserName} (${slackUserId}), count: ${newCount}`);
+  } catch (err) {
+    console.error(`Failed to update Notion for page ${pageId}:`, err.message);
+    throw err;
   }
 
-  console.log(`Marked page ${pageId} as confirmed by ${slackUserName} (${slackUserId})`);
   return { readerCount: newCount, readers: newReaders };
 }
 
