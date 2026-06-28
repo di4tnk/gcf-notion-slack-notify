@@ -77,8 +77,47 @@ async function fetchSlackDisplayName(userId, fallback) {
   }
 }
 
+// 確認済みコンテキストブロック（"確認済み N人"）から現在のカウントを取得する
+function extractConfirmedCount(blocks) {
+  for (const block of blocks ?? []) {
+    if (block.type !== 'context') continue;
+    for (const el of block.elements ?? []) {
+      const m = (el.text ?? '').match(/確認済み\s*(\d+)\s*人/);
+      if (m) return parseInt(m[1], 10);
+    }
+  }
+  return 0;
+}
+
+// 確認状態のブロック列を構築する。
+// actions ブロックと既存の確認状態 context を除去し、新しい確認状態 context を末尾に追加する。
+function buildConfirmedBlocks(originalBlocks, displayName, count) {
+  const filtered = originalBlocks.filter(b => {
+    if (b.type === 'actions') return false;
+    if (b.type === 'context') {
+      const isConfirmStatus = (b.elements ?? []).some(
+        el => (el.text ?? '').includes('確認済み') && (el.text ?? '').includes('人')
+      );
+      if (isConfirmStatus) return false;
+    }
+    return true;
+  });
+  return [
+    ...filtered,
+    {
+      type: 'context',
+      elements: [{
+        type: 'mrkdwn',
+        text: `✅ *${displayName}* が確認しました（確認済み ${count}人）`
+      }]
+    }
+  ];
+}
+
 // Slackインタラクションを処理し、response_url 経由でメッセージを更新する。
 // index.js が res.status(200).send('') で即座にSlackへ応答した後に呼ばれる想定。
+// オプティミスティックUI: API呼び出しを待たずに即座にメッセージを更新し、
+// Notion書き込み完了後に確定値で整合（失敗時は元に戻してエラーを通知）。
 async function handleSlackInteraction(payload) {
   const { type, actions, user, message, response_url } = payload;
 
@@ -94,53 +133,72 @@ async function handleSlackInteraction(payload) {
       return;
     }
 
-    // ① 即時 ephemeral フィードバック（連打防止: 押した瞬間に手応えを返す）
-    try {
-      await axios.post(response_url, {
-        response_type: 'ephemeral',
-        replace_original: false,
-        text: '✅ 確認を受け付けました（反映まで数秒かかることがあります）'
-      });
-    } catch (err) {
-      console.warn('Failed to send ephemeral ack:', err.message);
-    }
-
-    // ② 表示名取得（users.info — users:read スコープ必要）
-    const payloadFallback = user.name || user.username || user.id;
-    const userName = await fetchSlackDisplayName(user.id, payloadFallback);
-
-    // ③ Notion 更新（冪等: 同一ユーザーの連打でも確認数は増えない）
-    let readerCount = 0;
-    try {
-      const result = await markPageAsConfirmed(pageId, userName, user.id);
-      readerCount = result.readerCount;
-    } catch (err) {
-      console.error('Failed to update Notion confirmation status:', err.message);
-    }
-
-    // ④ 元メッセージをボタン除去＋確認済みフィードバックに置き換え
     const originalBlocks = message?.blocks ?? [];
-    const updatedBlocks = [
-      ...originalBlocks.filter(b => b.type !== 'actions'),
-      {
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: `✅ *${userName}* が確認しました（確認済み ${readerCount}人）`
-        }]
-      }
-    ];
+
+    // ① 楽観的更新（API呼び出しなしで即座に送信）
+    // payload の user から仮の表示名を作る（users.info の往復を待たない）
+    const optimisticName = user.name || user.username || user.id;
+    const currentCount = extractConfirmedCount(originalBlocks);
+    const optimisticCount = currentCount + 1;
 
     try {
       await axios.post(response_url, {
         response_type: 'in_channel',
         replace_original: true,
-        text: `✅ ${userName} が確認しました（確認済み ${readerCount}人）`,
-        blocks: updatedBlocks
+        text: `✅ ${optimisticName} が確認しました（確認済み ${optimisticCount}人）`,
+        blocks: buildConfirmedBlocks(originalBlocks, optimisticName, optimisticCount)
       });
-      console.log(`Slack message updated via response_url (page: ${pageId}, user: ${userName}, count: ${readerCount})`);
+      console.log(`Optimistic update sent (user: ${optimisticName}, count: ${optimisticCount})`);
     } catch (err) {
-      console.error('Failed to update Slack message via response_url:', err.message);
+      console.warn('Failed to send optimistic update:', err.message);
+    }
+
+    // ② 非同期: 正式な表示名を取得（users.info — users:read スコープ必要）
+    const payloadFallback = user.name || user.username || user.id;
+    const userName = await fetchSlackDisplayName(user.id, payloadFallback);
+
+    // ③ Notion 確定書き込み（冪等: 連打しても確認数は増えない）
+    let notionResult;
+    try {
+      notionResult = await markPageAsConfirmed(pageId, userName, user.id);
+    } catch (err) {
+      console.error('Failed to update Notion confirmation status:', err.message);
+      // 書き込み失敗: ephemeral エラー通知 + 楽観更新を取り消して元に戻す
+      try {
+        await axios.post(response_url, {
+          response_type: 'ephemeral',
+          replace_original: false,
+          text: '⚠️ 確認の記録に失敗しました。もう一度押してください。'
+        });
+      } catch (e) {
+        console.warn('Failed to send error ephemeral:', e.message);
+      }
+      try {
+        await axios.post(response_url, {
+          response_type: 'in_channel',
+          replace_original: true,
+          text: '📢 お知らせ',
+          blocks: originalBlocks
+        });
+      } catch (e) {
+        console.warn('Failed to revert optimistic update:', e.message);
+      }
+      return;
+    }
+
+    // ④ 確定値（正式名・Notion確定カウント）でメッセージを整合
+    // 楽観表示との差（名前の表記、冪等による数の違い）をここで吸収する
+    const { readerCount } = notionResult;
+    try {
+      await axios.post(response_url, {
+        response_type: 'in_channel',
+        replace_original: true,
+        text: `✅ ${userName} が確認しました（確認済み ${readerCount}人）`,
+        blocks: buildConfirmedBlocks(originalBlocks, userName, readerCount)
+      });
+      console.log(`Message reconciled (page: ${pageId}, user: ${userName}, count: ${readerCount})`);
+    } catch (err) {
+      console.error('Failed to reconcile Slack message:', err.message);
     }
   }
 
