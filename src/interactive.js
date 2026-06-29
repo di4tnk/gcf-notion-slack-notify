@@ -90,10 +90,10 @@ function extractConfirmedCount(blocks) {
 }
 
 // 確認状態のブロック列を構築する。
-// actions ブロックと既存の確認状態 context を除去し、新しい確認状態 context を末尾に追加する。
+// 既存の確認状態 context のみ置換し、actions（ボタン）は必ず残す。
+// ボタンを残すことで複数人が順に押せる。
 function buildConfirmedBlocks(originalBlocks, displayName, count) {
   const filtered = originalBlocks.filter(b => {
-    if (b.type === 'actions') return false;
     if (b.type === 'context') {
       const isConfirmStatus = (b.elements ?? []).some(
         el => (el.text ?? '').includes('確認済み') && (el.text ?? '').includes('人')
